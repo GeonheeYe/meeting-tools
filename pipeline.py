@@ -11,11 +11,17 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
+from silero_vad import (
+    collect_chunks, get_speech_timestamps, load_silero_vad,
+    read_audio, save_audio,
+)
+
 from context_loader import load as load_context
 from transcribe import format_transcript, transcribe
 
 # soundfile이 직접 읽지 못하는 포맷 → ffmpeg로 wav 변환
 _NEEDS_CONVERSION = {".m4a", ".mp3", ".mp4", ".aac", ".ogg", ".flac"}
+VAD_MIN_SILENCE_DURATION_MS = 3000
 
 
 def _to_wav(path: Path) -> Path:
@@ -28,19 +34,32 @@ def _to_wav(path: Path) -> Path:
     return out
 
 
+def normalize_terms(transcript: str, term_metadata: Optional[dict]) -> str:
+    """문서 근거가 있는 별칭만 정규 표현식 없이 보수적으로 치환한다."""
+    if not term_metadata:
+        return transcript
+
+    alias_map = term_metadata.get("alias_map", {})
+    normalized = transcript
+    for alias, canonical in sorted(alias_map.items(), key=lambda item: len(item[0]), reverse=True):
+        if not alias or alias == canonical:
+            continue
+        normalized = normalized.replace(alias, canonical)
+    return normalized
+
+
 def run_vad(path: Path) -> Path:
     """silero-vad로 무음 구간 제거. VAD 처리된 wav를 원본과 같은 디렉토리에 저장."""
-    from silero_vad import (
-        collect_chunks, get_speech_timestamps, load_silero_vad, read_audio, save_audio,
-    )
-    print("VAD 전처리 중...")
-    model = load_silero_vad()
+    # wav를 한 번만 읽어 VAD와 청크 추출에 모두 사용
     wav = read_audio(str(path), sampling_rate=16000)
+    duration_sec = len(wav) / 16000
+
+    model = load_silero_vad()
     speech_timestamps = get_speech_timestamps(
         wav, model,
         sampling_rate=16000,
-        speech_pad_ms=300,           # 발화 경계 앞뒤 300ms 패딩 → 씹힘 방지
-        min_silence_duration_ms=500, # 500ms 이상 침묵이어야 발화 분리
+        speech_pad_ms=300,
+        min_silence_duration_ms=VAD_MIN_SILENCE_DURATION_MS,
     )
 
     if not speech_timestamps:
@@ -51,9 +70,8 @@ def run_vad(path: Path) -> Path:
     out_path = path.parent / f"{path.stem}_vad.wav"
     save_audio(str(out_path), audio_chunks, sampling_rate=16000)
 
-    original_sec = len(wav) / 16000
     vad_sec = len(audio_chunks) / 16000
-    print(f"VAD 완료: {original_sec:.1f}s → {vad_sec:.1f}s ({100*vad_sec/original_sec:.0f}% 유지)")
+    print(f"VAD 완료: {duration_sec:.1f}s → {vad_sec:.1f}s ({100*vad_sec/duration_sec:.0f}% 유지)")
     return out_path
 
 
@@ -84,9 +102,10 @@ def run(
 
     # 참고 문서 로드 → initial_prompt 강화
     doc_content = ""
+    term_metadata = {"canonical_terms": [], "priority_terms": [], "alias_map": {}}
     if doc_paths:
         print(f"참고 문서 로드 중: {len(doc_paths)}개")
-        key_terms, doc_content = load_context(doc_paths)
+        key_terms, doc_content, term_metadata = load_context(doc_paths)
         if key_terms:
             context = f"{key_terms}, {context}" if context else key_terms
 
@@ -98,16 +117,20 @@ def run(
         print(f"컨텍스트: {context[:80]}...")
     print(f"{'='*50}\n")
 
-    # VAD 전처리 → 무음 제거 후 wav 저장
+    # STT + 화자 분리 (num_speakers 없으면 pyannote 생략)
+    if num_speakers is None:
+        print("화자 분리 생략 (--speakers 미지정)")
     vad_path = run_vad(path)
 
-    # STT + 화자 분리 (num_speakers 없으면 pyannote 생략)
-    skip_diarization = num_speakers is None
-    if skip_diarization:
+    if num_speakers is None:
         print("화자 분리 생략 (--speakers 미지정)")
-    merged = transcribe(str(vad_path), num_speakers=num_speakers, initial_prompt=context,
-                        skip_diarization=skip_diarization)
-    transcript = format_transcript(merged)
+    merged = transcribe(
+        str(vad_path),
+        num_speakers=num_speakers,
+        initial_prompt=context,
+        skip_diarization=num_speakers is None,
+    )
+    transcript = normalize_terms(format_transcript(merged), term_metadata)
     speaker_count = num_speakers or len(set(item["speaker"] for item in merged))
 
     # 결과 JSON 저장 (요약/Notion 업로드는 스킬이 처리)
