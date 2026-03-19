@@ -5,6 +5,7 @@ pyannote로 화자를 분리하고 두 결과를 병합한다.
 """
 import os
 import platform
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Optional
 
@@ -233,15 +234,19 @@ def transcribe(
     initial_prompt: Optional[str] = None,
     skip_diarization: bool = False,
 ) -> list[dict]:
-    """전체 파이프라인: STT + (선택적) 화자분리 + 병합."""
-    segments = run_whisper(audio_path, initial_prompt=initial_prompt)
-
+    """전체 파이프라인: STT + (선택적) 화자분리 병렬 실행 + 병합."""
     if skip_diarization:
-        # 화자 분리 없이 Speaker A 단일 레이블로 반환
+        segments = run_whisper(audio_path, initial_prompt=initial_prompt)
         return [{"speaker": "Speaker A", "start": s["start"],
                  "end": s["end"], "text": s["text"]} for s in segments]
 
-    turns = run_diarization(audio_path, num_speakers=num_speakers)
+    # STT와 화자분리를 병렬로 실행 (두 작업은 독립적)
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        stt_future = executor.submit(run_whisper, audio_path, initial_prompt)
+        diar_future = executor.submit(run_diarization, audio_path, num_speakers)
+
+    segments = stt_future.result()
+    turns = diar_future.result()
     return merge(segments, turns)
 
 
