@@ -24,6 +24,18 @@ from pyannote.audio import Pipeline
 
 load_dotenv(Path(__file__).parent / ".env")
 _WHISPER_MODEL = None
+_PYANNOTE_PIPELINE = None
+
+
+def get_pyannote_pipeline(hf_token: str):
+    """pyannote Pipeline을 1회만 로드하고 재사용한다."""
+    global _PYANNOTE_PIPELINE
+    if _PYANNOTE_PIPELINE is None:
+        _PYANNOTE_PIPELINE = Pipeline.from_pretrained(
+            "pyannote/speaker-diarization-3.1",
+            use_auth_token=hf_token,
+        )
+    return _PYANNOTE_PIPELINE
 
 
 def _is_apple_silicon() -> bool:
@@ -137,10 +149,7 @@ def run_diarization(audio_path: str, num_speakers: Optional[int] = None) -> list
         raise ValueError("HF_TOKEN 환경변수가 설정되지 않았습니다.")
 
     print("화자 분리 실행 중...")
-    pipeline = Pipeline.from_pretrained(
-        "pyannote/speaker-diarization-3.1",
-        use_auth_token=hf_token,
-    )
+    pipeline = get_pyannote_pipeline(hf_token)  # 캐싱된 pipeline 사용
     # 화자 수를 알고 있으면 힌트로 전달 → 분리 품질 향상
     diarize_kwargs = {}
     if num_speakers:
