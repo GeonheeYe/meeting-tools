@@ -13,14 +13,14 @@ class ContextLoaderTest(unittest.TestCase):
                 "AEGIS-AP WiNG VOC 기반 AI 분석 기능 개발 목표합의서",
                 encoding="utf-8",
             )
-
-            key_terms, doc_content, term_metadata = load([str(path)])
+            key_terms, doc_content, term_metadata, agenda_items = load([str(path)])
 
         self.assertTrue(key_terms)
         self.assertIn("AEGIS-AP", doc_content)
         self.assertIn("canonical_terms", term_metadata)
         self.assertIn("alias_map", term_metadata)
         self.assertIn("priority_terms", term_metadata)
+        self.assertIsInstance(agenda_items, list)
 
     def test_priority_terms_put_product_names_first(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -29,10 +29,28 @@ class ContextLoaderTest(unittest.TestCase):
                 "AEGIS-AP WiNG VOC 기반 AI 분석 기능 개발",
                 encoding="utf-8",
             )
-
-            _, _, term_metadata = load([str(path)])
+            _, _, term_metadata, _ = load([str(path)])
 
         self.assertIn("AEGIS-AP", term_metadata["priority_terms"])
+
+    def test_load_extracts_agenda_from_txt(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "agenda.txt"
+            path.write_text(
+                "1. VQML 표준화\n2. XTelLM 확보\n3. NDR 검토\n",
+                encoding="utf-8",
+            )
+            _, _, _, agenda_items = load([str(path)])
+
+        self.assertEqual(agenda_items, ["VQML 표준화", "XTelLM 확보", "NDR 검토"])
+
+    def test_load_returns_empty_agenda_when_no_agenda_structure(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "notes.txt"
+            path.write_text("일반 텍스트 내용입니다.", encoding="utf-8")
+            _, _, _, agenda_items = load([str(path)])
+
+        self.assertEqual(agenda_items, [])
 
 
 class ExtractAgendaItemsTest(unittest.TestCase):

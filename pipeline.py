@@ -103,9 +103,10 @@ def run(
     # 참고 문서 로드 → initial_prompt 강화
     doc_content = ""
     term_metadata = {"canonical_terms": [], "priority_terms": [], "alias_map": {}}
+    agenda_items = []
     if doc_paths:
         print(f"참고 문서 로드 중: {len(doc_paths)}개")
-        key_terms, doc_content, term_metadata = load_context(doc_paths)
+        key_terms, doc_content, term_metadata, agenda_items = load_context(doc_paths)
         if key_terms:
             context = f"{key_terms}, {context}" if context else key_terms
 
@@ -140,6 +141,7 @@ def run(
         "speaker_count": speaker_count,
         "transcript": transcript,
         "doc_content": doc_content,  # Claude 교정용, 없으면 ""
+        "agenda_items": agenda_items,  # 안건 항목 목록, 없으면 []
     }
     tmp_path = Path(f"/tmp/meeting_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json")
     tmp_path.write_text(json.dumps(result, ensure_ascii=False, indent=2))

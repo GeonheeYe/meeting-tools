@@ -151,9 +151,11 @@ def extract_term_metadata(text: str, max_terms: int = 30) -> dict:
 
 def load(doc_paths: list) -> tuple:
     """
-    문서 목록을 로드해서 (key_terms, doc_content, term_metadata) 반환.
+    문서 목록을 로드해서 (key_terms, doc_content, term_metadata, agenda_items) 4-tuple 반환.
     - key_terms: initial_prompt에 삽입
     - doc_content: Claude 교정용 전문
+    - term_metadata: 용어 우선순위와 표기 정규화 메타데이터
+    - agenda_items: 회의 안건 항목 목록
     """
     texts = []
     for p in doc_paths:
@@ -166,13 +168,14 @@ def load(doc_paths: list) -> tuple:
             texts.append(f"=== {path.name} ===\n{text}")
 
     if not texts:
-        return "", "", {"canonical_terms": [], "priority_terms": [], "alias_map": {}}
+        return "", "", {"canonical_terms": [], "priority_terms": [], "alias_map": {}}, []
 
     doc_content = "\n\n".join(texts)
     key_terms = extract_key_terms(doc_content)
     term_metadata = extract_term_metadata(doc_content)
+    agenda_items = extract_agenda_items(doc_content)
     print(f"[context_loader] 키워드 추출 완료: {key_terms[:80]}...")
-    return key_terms, doc_content, term_metadata
+    return key_terms, doc_content, term_metadata, agenda_items
 
 
 if __name__ == "__main__":
@@ -180,7 +183,8 @@ if __name__ == "__main__":
     if len(sys.argv) < 2:
         print("사용법: python context_loader.py <파일1> [파일2] ...")
         sys.exit(1)
-    terms, content, term_metadata = load(sys.argv[1:])
+    terms, content, term_metadata, agenda_items = load(sys.argv[1:])
     print(f"\n=== 키워드 ===\n{terms}")
     print(f"\n=== 본문 (앞 500자) ===\n{content[:500]}")
     print(f"\n=== 우선 용어 ===\n{term_metadata['priority_terms']}")
+    print(f"\n=== 안건 항목 ===\n{agenda_items}")
