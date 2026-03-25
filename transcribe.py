@@ -5,6 +5,9 @@ pyannote로 화자를 분리하고 두 결과를 병합한다.
 """
 import os
 import platform
+import re
+import subprocess
+import tempfile
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Optional
@@ -26,6 +29,10 @@ from pyannote.audio import Pipeline
 load_dotenv(Path(__file__).parent / ".env")
 _WHISPER_MODEL = None
 _PYANNOTE_PIPELINE = None
+DEFAULT_MAX_CHUNK_SEC = 90.0
+DEFAULT_OVERLAP_SEC = 3.0
+WHISPER_CONDITION_ON_PREVIOUS_TEXT = False
+WHISPER_NO_SPEECH_THRESHOLD = 0.4
 
 
 def get_pyannote_pipeline(hf_token: str):
@@ -86,9 +93,9 @@ def _run_whisper_faster(audio_path: str, initial_prompt: Optional[str] = None) -
     segments_gen, _ = model.transcribe(
         audio_path,
         language="ko",
-        condition_on_previous_text=False,
+        condition_on_previous_text=WHISPER_CONDITION_ON_PREVIOUS_TEXT,
         compression_ratio_threshold=2.4,
-        no_speech_threshold=0.5,
+        no_speech_threshold=WHISPER_NO_SPEECH_THRESHOLD,
         log_prob_threshold=-1.0,
         initial_prompt=initial_prompt,
         vad_filter=False,
@@ -111,8 +118,8 @@ def _run_whisper_mlx(audio_path: str, initial_prompt: Optional[str] = None) -> l
         path_or_hf_repo="mlx-community/whisper-large-v3-mlx",
         language="ko",
         initial_prompt=initial_prompt,
-        condition_on_previous_text=False,
-        no_speech_threshold=0.5,
+        condition_on_previous_text=WHISPER_CONDITION_ON_PREVIOUS_TEXT,
+        no_speech_threshold=WHISPER_NO_SPEECH_THRESHOLD,
         compression_ratio_threshold=2.4,
     )
     segments = [
@@ -129,6 +136,196 @@ def run_whisper(audio_path: str, initial_prompt: Optional[str] = None) -> list[d
     if _is_apple_silicon():
         return _run_whisper_mlx(audio_path, initial_prompt)
     return _run_whisper_faster(audio_path, initial_prompt)
+
+
+def _get_audio_duration(audio_path: str) -> Optional[float]:
+    """ffprobe로 오디오 길이를 구한다. 실패하면 None."""
+    try:
+        result = subprocess.run(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-show_entries",
+                "format=duration",
+                "-of",
+                "default=noprint_wrappers=1:nokey=1",
+                audio_path,
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return None
+
+    try:
+        return float(result.stdout.strip())
+    except ValueError:
+        return None
+
+
+def should_use_chunking(audio_path: str, max_chunk_sec: float = DEFAULT_MAX_CHUNK_SEC) -> bool:
+    """해당 오디오가 chunked STT 대상인지 판단한다."""
+    duration_sec = _get_audio_duration(audio_path)
+    return duration_sec is not None and duration_sec > max_chunk_sec
+
+
+def _build_chunk_ranges(duration_sec: float, max_chunk_sec: float, overlap_sec: float) -> list[tuple[float, float]]:
+    """길이를 기준으로 청크 구간 목록을 만든다."""
+    if duration_sec <= max_chunk_sec:
+        return [(0.0, duration_sec)]
+
+    ranges = []
+    start = 0.0
+    while start < duration_sec:
+        end = min(start + max_chunk_sec, duration_sec)
+        ranges.append((start, end))
+        if end >= duration_sec:
+            break
+        start = max(end - overlap_sec, start + 0.1)
+    return ranges
+
+
+MIN_CHUNK_SEC = 15.0
+
+
+def _build_vad_chunk_ranges(
+    speech_timestamps: list[dict],
+    duration_sec: float,
+    max_chunk_sec: float,
+) -> list[tuple[float, float]]:
+    """VAD 타임스탬프 기반으로 무음 구간에서 청크를 나눈다."""
+    if duration_sec <= max_chunk_sec:
+        return [(0.0, duration_sec)]
+
+    # 무음 구간 중간점 추출 (최소 0.3초 이상 무음)
+    silence_midpoints = []
+    for i in range(len(speech_timestamps) - 1):
+        gap_start = speech_timestamps[i]["end"] / 16000
+        gap_end = speech_timestamps[i + 1]["start"] / 16000
+        if gap_end - gap_start >= 0.3:
+            silence_midpoints.append((gap_start + gap_end) / 2)
+
+    if not silence_midpoints:
+        return _build_chunk_ranges(duration_sec, max_chunk_sec, DEFAULT_OVERLAP_SEC)
+
+    # 탐욕적 분할: max_chunk_sec 이내에서 가장 늦은 무음 지점에서 자르기
+    ranges = []
+    chunk_start = 0.0
+
+    while chunk_start < duration_sec - 1.0:
+        chunk_end_target = chunk_start + max_chunk_sec
+        if chunk_end_target >= duration_sec:
+            ranges.append((chunk_start, duration_sec))
+            break
+
+        best_split = None
+        for mp in silence_midpoints:
+            if chunk_start < mp <= chunk_end_target:
+                best_split = mp
+
+        if best_split:
+            ranges.append((chunk_start, best_split))
+            chunk_start = best_split
+        else:
+            # 무음 지점 없으면 고정 분할 (fallback)
+            ranges.append((chunk_start, chunk_end_target))
+            chunk_start = chunk_end_target
+
+    # 짧은 청크를 인접 청크와 합치기
+    merged = [ranges[0]]
+    for r in ranges[1:]:
+        prev_len = merged[-1][1] - merged[-1][0]
+        curr_len = r[1] - r[0]
+        if prev_len < MIN_CHUNK_SEC or curr_len < MIN_CHUNK_SEC:
+            merged[-1] = (merged[-1][0], r[1])
+        else:
+            merged.append(r)
+
+    return merged
+
+
+def _extract_audio_chunk(audio_path: str, start_sec: float, end_sec: float, chunk_index: int) -> str:
+    """ffmpeg로 청크를 임시 wav로 추출한다."""
+    duration = max(end_sec - start_sec, 0.1)
+    tmp_dir = Path(tempfile.gettempdir())
+    fd, out_str = tempfile.mkstemp(
+        prefix=f"meeting_chunk_{Path(audio_path).stem}_{chunk_index}_",
+        suffix=".wav",
+        dir=tmp_dir,
+    )
+    os.close(fd)
+    Path(out_str).unlink(missing_ok=True)
+    out_path = Path(out_str)
+    subprocess.run(
+        [
+            "ffmpeg",
+            "-v",
+            "error",
+            "-ss",
+            f"{start_sec:.3f}",
+            "-t",
+            f"{duration:.3f}",
+            "-i",
+            audio_path,
+            "-ar",
+            "16000",
+            "-ac",
+            "1",
+            str(out_path),
+            "-y",
+        ],
+        check=True,
+        capture_output=True,
+    )
+    return str(out_path)
+
+
+def run_whisper_chunked(
+    audio_path: str,
+    initial_prompt: Optional[str] = None,
+    max_chunk_sec: float = DEFAULT_MAX_CHUNK_SEC,
+    overlap_sec: float = DEFAULT_OVERLAP_SEC,
+    speech_timestamps: Optional[list[dict]] = None,
+) -> list[dict]:
+    """긴 오디오는 청크로 나눠 Whisper를 실행하고 병합한다."""
+    duration_sec = _get_audio_duration(audio_path)
+    if duration_sec is None or duration_sec <= max_chunk_sec:
+        return run_whisper(audio_path, initial_prompt=initial_prompt)
+
+    # VAD 기반 청크 분할 (speech_timestamps가 있으면 사용)
+    if speech_timestamps:
+        chunk_ranges = _build_vad_chunk_ranges(speech_timestamps, duration_sec, max_chunk_sec)
+        print(f"VAD 기반 청크 분할: {len(chunk_ranges)}개")
+    else:
+        chunk_ranges = _build_chunk_ranges(duration_sec, max_chunk_sec, overlap_sec)
+        print(f"고정 시간 청크 분할: {len(chunk_ranges)}개")
+
+    all_segments = []
+    prev_chunk_text = ""
+
+    for index, (start_sec, end_sec) in enumerate(chunk_ranges):
+        # 이전 청크 텍스트를 initial_prompt에 추가 (문맥 연결)
+        chunk_prompt = initial_prompt or ""
+        if prev_chunk_text:
+            tail = prev_chunk_text[-200:]
+            chunk_prompt = f"{chunk_prompt}\n{tail}".strip() if chunk_prompt else tail
+
+        chunk_path = None
+        try:
+            chunk_path = _extract_audio_chunk(audio_path, start_sec, end_sec, index)
+            chunk_segments = run_whisper(chunk_path, initial_prompt=chunk_prompt or None)
+
+            # 이 청크 텍스트를 다음 청크 프롬프트용으로 저장
+            prev_chunk_text = " ".join(s["text"] for s in chunk_segments)
+
+            all_segments.append(offset_segments(chunk_segments, start_sec))
+        finally:
+            if chunk_path:
+                Path(chunk_path).unlink(missing_ok=True)
+
+    return merge_chunk_segments(all_segments)
 
 
 def offset_segments(segments: list[dict], chunk_start: float) -> list[dict]:
@@ -213,8 +410,31 @@ def deduplicate_overlap_text(first_lines: list[str], second_lines: list[str]) ->
     return merged
 
 
+def _text_similarity(a: str, b: str) -> float:
+    """두 텍스트의 유사도를 0~1로 반환한다 (편집거리 기반)."""
+    a, b = a.strip(), b.strip()
+    if not a or not b:
+        return 0.0
+    if a == b:
+        return 1.0
+    max_len = max(len(a), len(b))
+    # 길이 차이가 크면 빠르게 비유사 판정
+    if abs(len(a) - len(b)) / max_len > 0.5:
+        return 0.0
+    # 간단한 편집거리 (DP)
+    m, n = len(a), len(b)
+    prev = list(range(n + 1))
+    for i in range(1, m + 1):
+        curr = [i] + [0] * n
+        for j in range(1, n + 1):
+            cost = 0 if a[i - 1] == b[j - 1] else 1
+            curr[j] = min(curr[j - 1] + 1, prev[j] + 1, prev[j - 1] + cost)
+        prev = curr
+    return 1.0 - prev[n] / max_len
+
+
 def merge_chunk_segments(chunks: list[list[dict]]) -> list[dict]:
-    """청크별 세그먼트를 시간순으로 합치고 단순 중복을 제거한다."""
+    """청크별 세그먼트를 시간순으로 합치고 유사 중복을 제거한다."""
     merged = sorted(
         [segment for chunk in chunks for segment in chunk],
         key=lambda item: (item["start"], item["end"]),
@@ -222,8 +442,12 @@ def merge_chunk_segments(chunks: list[list[dict]]) -> list[dict]:
 
     deduplicated = []
     for seg in merged:
-        if deduplicated and deduplicated[-1]["text"].strip() == seg["text"].strip():
-            continue
+        if deduplicated:
+            prev = deduplicated[-1]
+            # 시간이 겹치거나 인접 + 텍스트 유사도 80% 이상이면 중복
+            time_overlap = prev["end"] > seg["start"] - 1.0
+            if time_overlap and _text_similarity(prev["text"], seg["text"]) >= 0.8:
+                continue
         deduplicated.append(seg)
     return deduplicated
 
@@ -233,21 +457,66 @@ def transcribe(
     num_speakers: Optional[int] = None,
     initial_prompt: Optional[str] = None,
     skip_diarization: bool = False,
+    speech_timestamps: Optional[list[dict]] = None,
 ) -> list[dict]:
     """전체 파이프라인: STT + (선택적) 화자분리 병렬 실행 + 병합."""
     if skip_diarization:
-        segments = run_whisper(audio_path, initial_prompt=initial_prompt)
+        segments = run_whisper_chunked(audio_path, initial_prompt=initial_prompt, speech_timestamps=speech_timestamps)
         return [{"speaker": "Speaker A", "start": s["start"],
                  "end": s["end"], "text": s["text"]} for s in segments]
 
     # STT와 화자분리를 병렬로 실행 (두 작업은 독립적)
     with ThreadPoolExecutor(max_workers=2) as executor:
-        stt_future = executor.submit(run_whisper, audio_path, initial_prompt)
+        stt_future = executor.submit(
+            run_whisper_chunked, audio_path, initial_prompt,
+            DEFAULT_MAX_CHUNK_SEC, DEFAULT_OVERLAP_SEC, speech_timestamps,
+        )
         diar_future = executor.submit(run_diarization, audio_path, num_speakers)
 
     segments = stt_future.result()
     turns = diar_future.result()
     return merge(segments, turns)
+
+
+def _collapse_runaway_syllables(text: str) -> str:
+    """붙은 짧은 음절 반복 노이즈를 1회로 줄인다."""
+    return re.sub(r"\b([가-힣A-Za-z])\1{2,}\b", r"\1", text)
+
+
+def _collapse_runaway_short_tokens(text: str) -> str:
+    """짧은 단어가 과도하게 반복되면 2회까지만 남긴다."""
+    return re.sub(r"\b([가-힣A-Za-z]{1,3})(?:\s+\1){2,}\b", r"\1 \1", text)
+
+
+def _remove_hallucination_fragments(text: str) -> str:
+    """Whisper 환각으로 생성된 비한국어 깨진 토큰을 제거한다."""
+    # 라틴 특수문자 조합 (예: "장łe의", "adjective은")
+    cleaned = re.sub(r"[가-힣A-Za-z]*[ąćęłńóśźżĄĆĘŁŃÓŚŹŻ]+[가-힣A-Za-z]*", "", text)
+    # 한국어 문맥에서 영단어만 반복되는 환각 (예: "them", "the")
+    cleaned = re.sub(r"\b(them|the|and|of|is|to|in|it|for|that|this|with|you|are|was|have|has)\b", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\s{2,}", " ", cleaned).strip()
+    return cleaned
+
+
+def _is_hallucination_segment(text: str) -> bool:
+    """세그먼트 전체가 환각인지 판단한다."""
+    cleaned = text.strip()
+    if not cleaned:
+        return True
+    # 한국어가 전혀 없고 의미 있는 내용도 없는 경우
+    has_korean = bool(re.search(r"[가-힣]", cleaned))
+    if not has_korean and len(cleaned) < 20:
+        return True
+    return False
+
+
+def clean_repetition_noise(text: str) -> str:
+    """STT가 만든 비정상 반복 노이즈를 보수적으로 정리한다."""
+    cleaned = _collapse_runaway_syllables(text)
+    cleaned = _collapse_runaway_short_tokens(cleaned)
+    cleaned = _remove_hallucination_fragments(cleaned)
+    cleaned = re.sub(r"\s{2,}", " ", cleaned).strip()
+    return cleaned
 
 
 def format_transcript(merged: list[dict]) -> str:
@@ -261,8 +530,11 @@ def format_transcript(merged: list[dict]) -> str:
     repeat_count = 0
 
     for item in merged:
-        text = item["text"]
+        text = clean_repetition_noise(item["text"])
         speaker = item["speaker"]
+
+        if not text:
+            continue
 
         # 동일 텍스트 3회 이상 연속 반복 시 스킵
         if text == prev_text:

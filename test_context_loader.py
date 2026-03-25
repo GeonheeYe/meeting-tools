@@ -2,6 +2,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import pipeline
 from context_loader import load
 
 
@@ -51,6 +52,31 @@ class ContextLoaderTest(unittest.TestCase):
             _, _, _, agenda_items = load([str(path)])
 
         self.assertEqual(agenda_items, [])
+
+    def test_alias_map_includes_segmented_product_variants(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "terms.txt"
+            path.write_text("XTelLM VQML MOS", encoding="utf-8")
+            _, _, term_metadata, _ = load([str(path)])
+
+        self.assertEqual(term_metadata["alias_map"]["X Tel LM"], "XTelLM")
+        self.assertEqual(term_metadata["alias_map"]["V Q M L"], "VQML")
+        self.assertEqual(term_metadata["alias_map"]["M O S"], "MOS")
+
+    def test_normalize_terms_uses_segmented_aliases_from_docs(self):
+        transcript = "X Tel LM과 V Q M L, M O S를 같이 검토합니다."
+        normalized = pipeline.normalize_terms(
+            transcript,
+            {
+                "alias_map": {
+                    "X Tel LM": "XTelLM",
+                    "V Q M L": "VQML",
+                    "M O S": "MOS",
+                }
+            },
+        )
+
+        self.assertEqual(normalized, "XTelLM과 VQML, MOS를 같이 검토합니다.")
 
 
 class ExtractAgendaItemsTest(unittest.TestCase):

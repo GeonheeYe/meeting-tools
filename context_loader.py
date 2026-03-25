@@ -11,6 +11,11 @@ from pathlib import Path
 from typing import Optional
 
 
+def _tokenize_compound_term(term: str) -> list[str]:
+    """CamelCase/약어가 섞인 용어를 사람이 읽는 토큰으로 나눈다."""
+    return re.findall(r"[A-Z]+(?=[A-Z][a-z]|\d|$)|[A-Z]?[a-z]+|\d+", term)
+
+
 def extract_text(path: Path) -> str:
     """파일 포맷에 맞게 텍스트 추출."""
     suffix = path.suffix.lower()
@@ -138,6 +143,13 @@ def extract_term_metadata(text: str, max_terms: int = 30) -> dict:
         if "-" in term:
             alias_map[term.replace("-", " ")] = term
             alias_map[term.replace("-", "")] = term
+        tokens = _tokenize_compound_term(term)
+        if len(tokens) >= 2:
+            alias_map[" ".join(tokens)] = term
+            alias_map[" ".join(token.upper() for token in tokens)] = term
+            alias_map[" ".join(token.lower() for token in tokens)] = term
+        if re.fullmatch(r"[A-Z]{2,}", term):
+            alias_map[" ".join(term)] = term
 
     for acronym in re.findall(r"\b[A-Z]{2,}\b", text):
         alias_map[acronym.title()] = acronym

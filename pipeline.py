@@ -5,8 +5,11 @@
 요약 및 Notion 업로드는 /meeting 스킬이 직접 처리한다.
 """
 import json
+import os
+import re
 import subprocess
 import sys
+import tempfile
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -17,19 +20,47 @@ from silero_vad import (
 )
 
 from context_loader import load as load_context
-from transcribe import format_transcript, transcribe
+from transcribe import format_transcript, should_use_chunking, transcribe
 
 # soundfile이 직접 읽지 못하는 포맷 → ffmpeg로 wav 변환
 _NEEDS_CONVERSION = {".m4a", ".mp3", ".mp4", ".aac", ".ogg", ".flac"}
-VAD_MIN_SILENCE_DURATION_MS = 3000
+VAD_MIN_SILENCE_DURATION_MS = 2000
+VAD_SPEECH_PAD_MS = 1000
+ENHANCED_AUDIO_FILTER = "loudnorm=I=-16:LRA=7:TP=-1,dynaudnorm=f=120:g=31,acompressor=threshold=0.05:ratio=4:attack=10:release=150:makeup=4"
 
 
 def _to_wav(path: Path) -> Path:
     """ffmpeg로 16kHz mono wav로 변환. 변환된 임시 파일 경로 반환."""
-    out = Path(f"/tmp/{path.stem}_converted.wav")
+    fd, out_str = tempfile.mkstemp(prefix=f"{path.stem}_converted_", suffix=".wav", dir="/tmp")
+    os.close(fd)
+    Path(out_str).unlink(missing_ok=True)
+    out = Path(out_str)
     subprocess.run(
         ["ffmpeg", "-i", str(path), "-ar", "16000", "-ac", "1", str(out), "-y"],
         check=True, capture_output=True,
+    )
+    return out
+
+
+def enhance_audio_for_stt(path: Path) -> Path:
+    """STT용 오디오 보정본을 원본 옆에 저장한다."""
+    out = path.with_name(f"{path.stem}_enhanced.wav")
+    subprocess.run(
+        [
+            "ffmpeg",
+            "-i",
+            str(path),
+            "-af",
+            ENHANCED_AUDIO_FILTER,
+            "-ar",
+            "16000",
+            "-ac",
+            "1",
+            str(out),
+            "-y",
+        ],
+        check=True,
+        capture_output=True,
     )
     return out
 
@@ -44,7 +75,8 @@ def normalize_terms(transcript: str, term_metadata: Optional[dict]) -> str:
     for alias, canonical in sorted(alias_map.items(), key=lambda item: len(item[0]), reverse=True):
         if not alias or alias == canonical:
             continue
-        normalized = normalized.replace(alias, canonical)
+        pattern = re.compile(rf"(?<![A-Za-z0-9]){re.escape(alias)}(?![A-Za-z0-9])", flags=re.IGNORECASE)
+        normalized = pattern.sub(canonical, normalized)
     return normalized
 
 
@@ -58,7 +90,7 @@ def run_vad(path: Path) -> Path:
     speech_timestamps = get_speech_timestamps(
         wav, model,
         sampling_rate=16000,
-        speech_pad_ms=300,
+        speech_pad_ms=VAD_SPEECH_PAD_MS,
         min_silence_duration_ms=VAD_MIN_SILENCE_DURATION_MS,
     )
 
@@ -106,7 +138,11 @@ def run(
     agenda_items = []
     if doc_paths:
         print(f"참고 문서 로드 중: {len(doc_paths)}개")
-        key_terms, doc_content, term_metadata, agenda_items = load_context(doc_paths)
+        try:
+            key_terms, doc_content, term_metadata, agenda_items = load_context(doc_paths)
+        except Exception as exc:
+            print(f"참고 문서 로드 실패, 기본 STT로 계속 진행: {exc}")
+            key_terms = ""
         if key_terms:
             context = f"{key_terms}, {context}" if context else key_terms
 
@@ -121,15 +157,44 @@ def run(
     # STT + 화자 분리 (num_speakers 없으면 pyannote 생략)
     if num_speakers is None:
         print("화자 분리 생략 (--speakers 미지정)")
-    vad_path = run_vad(path)
+
+    stt_input_path = path
+    audio_enhanced = False
+    try:
+        stt_input_path = enhance_audio_for_stt(path)
+        audio_enhanced = stt_input_path != path
+    except Exception as exc:
+        print(f"오디오 보정 실패, 원본 오디오로 계속 진행: {exc}")
+        stt_input_path = path
+
+    # VAD로 발화 구간 감지 (항상 실행 — 청크 분할에 사용)
+    speech_timestamps = None
+    try:
+        wav = read_audio(str(stt_input_path), sampling_rate=16000)
+        model = load_silero_vad()
+        speech_timestamps = get_speech_timestamps(
+            wav, model,
+            sampling_rate=16000,
+            speech_pad_ms=VAD_SPEECH_PAD_MS,
+            min_silence_duration_ms=VAD_MIN_SILENCE_DURATION_MS,
+        )
+        if speech_timestamps:
+            print(f"VAD: {len(speech_timestamps)}개 발화 구간 감지")
+        else:
+            print("VAD: 발화 구간 없음")
+    except Exception as exc:
+        print(f"VAD 실패, 고정 분할로 진행: {exc}")
+
+    chunking_applied = should_use_chunking(str(stt_input_path))
 
     if num_speakers is None:
         print("화자 분리 생략 (--speakers 미지정)")
     merged = transcribe(
-        str(vad_path),
+        str(stt_input_path),
         num_speakers=num_speakers,
         initial_prompt=context,
         skip_diarization=num_speakers is None,
+        speech_timestamps=speech_timestamps,
     )
     transcript = normalize_terms(format_transcript(merged), term_metadata)
     speaker_count = num_speakers or len(set(item["speaker"] for item in merged))
@@ -142,24 +207,27 @@ def run(
         "transcript": transcript,
         "doc_content": doc_content,  # Claude 교정용, 없으면 ""
         "agenda_items": agenda_items,  # 안건 항목 목록, 없으면 []
+        "vad_applied": speech_timestamps is not None and len(speech_timestamps) > 0,
+        "chunking_applied": chunking_applied,
+        "source_audio_path": str(original_path),
+        "stt_audio_path": str(stt_input_path),
+        "term_metadata_applied": bool(term_metadata.get("priority_terms") or term_metadata.get("alias_map")),
+        "audio_enhanced": audio_enhanced,
     }
-    tmp_path = Path(f"/tmp/meeting_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json")
-    tmp_path.write_text(json.dumps(result, ensure_ascii=False, indent=2))
-
-    # 영구 보관용 JSON (원본 오디오 파일과 같은 디렉토리에 저장)
+    # 결과 JSON은 원본 오디오 파일과 같은 디렉토리에 저장
     save_dir = original_path.parent
     save_path = save_dir / f"{original_path.stem}.json"
     save_path.write_text(json.dumps(result, ensure_ascii=False, indent=2))
     print(f"STT 결과 저장: {save_path}")
 
-    # 변환된 임시 wav 파일 정리 (VAD 파일은 원본 옆에 영구 보관)
+    # 임시 파일 정리 (enhanced.wav는 유지)
     if converted and converted.exists():
         converted.unlink()
 
     print(f"\n{'='*50}")
-    print(f"처리 완료. 결과: {tmp_path}")
+    print(f"처리 완료. 결과: {save_path}")
     print(f"{'='*50}\n")
-    return str(tmp_path)
+    return str(save_path)
 
 
 if __name__ == "__main__":

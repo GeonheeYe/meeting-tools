@@ -1,22 +1,86 @@
 # ~/meeting_tools/record.py
 """
 마이크로 회의를 녹음하고 WAV 파일로 저장한다.
-사용법: python record.py [출력파일경로]
+사용법: python record.py [출력파일경로] [--device 장치명 또는 id]
 종료: Enter 키
 """
+import argparse
 import sys
 import threading
 from datetime import datetime
 from pathlib import Path
+from typing import Optional
 
 import numpy as np
 import sounddevice as sd
 from scipy.io import wavfile
 
 SAMPLE_RATE = 16000  # Whisper 최적 샘플레이트
+PREFERRED_INPUT_KEYWORDS = [
+    "jabra",
+    "speak",
+    "speakerphone",
+    "conference",
+    "meeting",
+    "mic",
+    "마이크",
+]
 
 
-def record(output_path: Path) -> None:
+def find_input_devices(devices: list[dict]) -> list[dict]:
+    """입력 가능한 장치만 추린다."""
+    return [device for device in devices if device.get("max_input_channels", 0) > 0]
+
+
+def choose_input_device(devices: list[dict], requested_device: Optional[str] = None) -> dict:
+    """요청 장치 또는 회의용 마이크 우선순위로 입력 장치를 고른다."""
+    input_devices = find_input_devices(devices)
+    if not input_devices:
+        raise ValueError("사용 가능한 입력 장치를 찾을 수 없습니다.")
+
+    if requested_device:
+        if requested_device.isdigit():
+            device_index = int(requested_device)
+            if 0 <= device_index < len(input_devices):
+                return input_devices[device_index]
+            raise ValueError(f"입력 장치 번호가 유효하지 않습니다: {requested_device}")
+
+        requested_lower = requested_device.lower()
+        for device in input_devices:
+            if requested_lower in device["name"].lower():
+                return device
+        raise ValueError(f"요청한 입력 장치를 찾을 수 없습니다: {requested_device}")
+
+    def score(device: dict) -> int:
+        name = device["name"].lower()
+        for index, keyword in enumerate(PREFERRED_INPUT_KEYWORDS):
+            if keyword in name:
+                return len(PREFERRED_INPUT_KEYWORDS) - index
+        return 0
+
+    return max(input_devices, key=score) if max(score(d) for d in input_devices) > 0 else input_devices[0]
+
+
+def list_input_devices() -> list[dict]:
+    """현재 시스템의 입력 장치 목록을 반환한다."""
+    devices = sd.query_devices()
+    normalized = []
+    for index, device in enumerate(devices):
+        item = dict(device)
+        item["id"] = index
+        normalized.append(item)
+    return find_input_devices(normalized)
+
+
+def parse_args(argv: Optional[list[str]] = None):
+    parser = argparse.ArgumentParser(description="회의 녹음 도구")
+    parser.add_argument("output", nargs="?", help="출력 파일 경로")
+    parser.add_argument("--device", help="입력 장치 id 또는 이름 일부")
+    parser.add_argument("--list-devices", action="store_true", help="사용 가능한 입력 장치 목록 출력")
+    return parser.parse_args(argv)
+
+
+def record(output_path: Path, requested_device: Optional[str] = None) -> None:
     chunks = []
 
     def callback(indata, frames, time, status):
@@ -26,6 +90,10 @@ def record(output_path: Path) -> None:
 
     print(f"녹음 시작... (종료하려면 Enter 키를 누르세요)")
     print(f"저장 경로: {output_path}")
+
+    devices = list_input_devices()
+    selected = choose_input_device(devices, requested_device=requested_device)
+    print(f"입력 장치: {selected['name']} (id: {selected['id']})")
 
     stop_event = threading.Event()
 
@@ -40,7 +108,13 @@ def record(output_path: Path) -> None:
     t = threading.Thread(target=wait_for_enter, daemon=True)
     t.start()
 
-    with sd.InputStream(samplerate=SAMPLE_RATE, channels=1, dtype="float32", callback=callback):
+    with sd.InputStream(
+        samplerate=SAMPLE_RATE,
+        channels=1,
+        dtype="float32",
+        callback=callback,
+        device=selected["id"],
+    ):
         try:
             stop_event.wait()  # 메인 스레드에서 대기 → Ctrl+C 정상 수신
         except KeyboardInterrupt:
@@ -58,11 +132,18 @@ def record(output_path: Path) -> None:
 
 
 if __name__ == "__main__":
-    if len(sys.argv) > 1:
-        out = Path(sys.argv[1])
+    args = parse_args()
+
+    if args.list_devices:
+        for device in list_input_devices():
+            print(f"{device['id']}: {device['name']} (input={device['max_input_channels']})")
+        sys.exit(0)
+
+    if args.output:
+        out = Path(args.output)
     else:
         ts = datetime.now().strftime("%Y%m%d_%H%M")
         out = Path.home() / "meetings" / f"audio_{ts}.wav"
 
     out.parent.mkdir(parents=True, exist_ok=True)
-    record(out)
+    record(out, requested_device=args.device)
