@@ -5,8 +5,10 @@
 종료: Enter 키
 """
 import argparse
+import signal
 import sys
 import threading
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -16,6 +18,7 @@ import sounddevice as sd
 from scipy.io import wavfile
 
 SAMPLE_RATE = 16000  # Whisper 최적 샘플레이트
+AUTO_SAVE_INTERVAL_SEC = 5
 PREFERRED_INPUT_KEYWORDS = [
     "jabra",
     "speak",
@@ -25,6 +28,24 @@ PREFERRED_INPUT_KEYWORDS = [
     "mic",
     "마이크",
 ]
+
+
+def _partial_output_path(output_path: Path) -> Path:
+    """녹음 중 임시 저장 파일 경로를 만든다."""
+    return output_path.with_name(f"{output_path.stem}_inprogress.wav")
+
+
+def save_recording(chunks: list[np.ndarray], output_path: Path, final: bool = False) -> Path:
+    """현재까지 녹음된 청크를 wav로 저장한다."""
+    target_path = output_path if final else _partial_output_path(output_path)
+    audio = np.concatenate(chunks, axis=0)
+    audio_int16 = (audio * 32767).astype(np.int16)
+    wavfile.write(str(target_path), SAMPLE_RATE, audio_int16)
+
+    if final:
+        _partial_output_path(output_path).unlink(missing_ok=True)
+
+    return target_path
 
 
 def find_input_devices(devices: list[dict]) -> list[dict]:
@@ -96,6 +117,7 @@ def record(output_path: Path, requested_device: Optional[str] = None) -> None:
     print(f"입력 장치: {selected['name']} (id: {selected['id']})")
 
     stop_event = threading.Event()
+    previous_handlers = {}
 
     def wait_for_enter():
         try:
@@ -108,27 +130,53 @@ def record(output_path: Path, requested_device: Optional[str] = None) -> None:
     t = threading.Thread(target=wait_for_enter, daemon=True)
     t.start()
 
-    with sd.InputStream(
-        samplerate=SAMPLE_RATE,
-        channels=1,
-        dtype="float32",
-        callback=callback,
-        device=selected["id"],
-    ):
-        try:
-            stop_event.wait()  # 메인 스레드에서 대기 → Ctrl+C 정상 수신
-        except KeyboardInterrupt:
-            print("\nCtrl+C 감지, 저장 중...")
+    def handle_signal(signum, frame):
+        print(f"\n종료 신호 감지({signum}), 저장 준비 중...")
+        stop_event.set()
+
+    for signum in (signal.SIGINT, signal.SIGTERM):
+        previous_handlers[signum] = signal.getsignal(signum)
+        signal.signal(signum, handle_signal)
+
+    last_saved_chunk_count = 0
+    last_auto_save_at = time.monotonic()
+
+    try:
+        with sd.InputStream(
+            samplerate=SAMPLE_RATE,
+            channels=1,
+            dtype="float32",
+            callback=callback,
+            device=selected["id"],
+        ):
+            try:
+                while not stop_event.wait(timeout=0.5):
+                    if not chunks:
+                        continue
+                    if len(chunks) == last_saved_chunk_count:
+                        continue
+                    now = time.monotonic()
+                    if now - last_auto_save_at < AUTO_SAVE_INTERVAL_SEC:
+                        continue
+
+                    partial_path = save_recording(chunks, output_path, final=False)
+                    last_saved_chunk_count = len(chunks)
+                    last_auto_save_at = now
+                    print(f"임시 저장: {partial_path}")
+            except KeyboardInterrupt:
+                print("\nCtrl+C 감지, 저장 준비 중...")
+                stop_event.set()
+    finally:
+        for signum, handler in previous_handlers.items():
+            signal.signal(signum, handler)
 
     if not chunks:
         print("녹음된 데이터가 없습니다.")
         return
 
     print("녹음 종료 중...")
-    audio = np.concatenate(chunks, axis=0)
-    audio_int16 = (audio * 32767).astype(np.int16)
-    wavfile.write(str(output_path), SAMPLE_RATE, audio_int16)
-    print(f"저장 완료: {output_path}")
+    final_path = save_recording(chunks, output_path, final=True)
+    print(f"저장 완료: {final_path}")
 
 
 if __name__ == "__main__":

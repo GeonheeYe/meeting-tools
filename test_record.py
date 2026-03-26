@@ -1,5 +1,10 @@
 import unittest
 from unittest.mock import patch
+from pathlib import Path
+import tempfile
+
+import numpy as np
+from scipy.io import wavfile
 
 import record
 
@@ -64,6 +69,35 @@ class RecordArgumentParsingTest(unittest.TestCase):
 
         self.assertTrue(args.list_devices)
         self.assertEqual(args.device, "Jabra Speak 710")
+
+
+class RecordPersistenceTest(unittest.TestCase):
+    def test_save_recording_writes_partial_wav_with_inprogress_suffix(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_path = Path(tmpdir) / "meeting.wav"
+            chunks = [np.array([[0.25], [-0.25]], dtype=np.float32)]
+
+            saved_path = record.save_recording(chunks, output_path, final=False)
+
+            self.assertEqual(saved_path, output_path.with_name("meeting_inprogress.wav"))
+            self.assertTrue(saved_path.exists())
+            sample_rate, audio = wavfile.read(saved_path)
+            self.assertEqual(sample_rate, record.SAMPLE_RATE)
+            self.assertEqual(audio.tolist(), [8191, -8191])
+
+    def test_save_recording_finalizes_and_removes_partial_file(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_path = Path(tmpdir) / "meeting.wav"
+            partial_path = output_path.with_name("meeting_inprogress.wav")
+            chunks = [np.array([[0.1], [0.0]], dtype=np.float32)]
+
+            partial_path.write_bytes(b"partial")
+
+            saved_path = record.save_recording(chunks, output_path, final=True)
+
+            self.assertEqual(saved_path, output_path)
+            self.assertTrue(saved_path.exists())
+            self.assertFalse(partial_path.exists())
 
 
 if __name__ == "__main__":
