@@ -1,7 +1,7 @@
 # ~/meeting_tools/pipeline.py
 """
 전체 파이프라인 실행:
-오디오 파일 → VAD 전처리 → STT → 화자분리 → 병합 → JSON 저장
+오디오 파일 → 오디오 보정 → STT → 화자분리 → 병합 → JSON 저장
 요약 및 Notion 업로드는 /meeting 스킬이 직접 처리한다.
 """
 import json
@@ -14,18 +14,11 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-from silero_vad import (
-    collect_chunks, get_speech_timestamps, load_silero_vad,
-    read_audio, save_audio,
-)
-
 from context_loader import load as load_context
 from transcribe import format_transcript, should_use_chunking, transcribe
 
 # soundfile이 직접 읽지 못하는 포맷 → ffmpeg로 wav 변환
 _NEEDS_CONVERSION = {".m4a", ".mp3", ".mp4", ".aac", ".ogg", ".flac"}
-VAD_MIN_SILENCE_DURATION_MS = 2000
-VAD_SPEECH_PAD_MS = 1000
 ENHANCED_AUDIO_FILTER = "loudnorm=I=-16:LRA=7:TP=-1,dynaudnorm=f=120:g=31,acompressor=threshold=0.05:ratio=4:attack=10:release=150:makeup=4"
 
 
@@ -78,33 +71,6 @@ def normalize_terms(transcript: str, term_metadata: Optional[dict]) -> str:
         pattern = re.compile(rf"(?<![A-Za-z0-9]){re.escape(alias)}(?![A-Za-z0-9])", flags=re.IGNORECASE)
         normalized = pattern.sub(canonical, normalized)
     return normalized
-
-
-def run_vad(path: Path) -> Path:
-    """silero-vad로 무음 구간 제거. VAD 처리된 wav를 원본과 같은 디렉토리에 저장."""
-    # wav를 한 번만 읽어 VAD와 청크 추출에 모두 사용
-    wav = read_audio(str(path), sampling_rate=16000)
-    duration_sec = len(wav) / 16000
-
-    model = load_silero_vad()
-    speech_timestamps = get_speech_timestamps(
-        wav, model,
-        sampling_rate=16000,
-        speech_pad_ms=VAD_SPEECH_PAD_MS,
-        min_silence_duration_ms=VAD_MIN_SILENCE_DURATION_MS,
-    )
-
-    if not speech_timestamps:
-        print("VAD: 발화 구간 없음, 원본 사용")
-        return path
-
-    audio_chunks = collect_chunks(speech_timestamps, wav)
-    out_path = path.parent / f"{path.stem}_vad.wav"
-    save_audio(str(out_path), audio_chunks, sampling_rate=16000)
-
-    vad_sec = len(audio_chunks) / 16000
-    print(f"VAD 완료: {duration_sec:.1f}s → {vad_sec:.1f}s ({100*vad_sec/duration_sec:.0f}% 유지)")
-    return out_path
 
 
 def run(
@@ -167,24 +133,6 @@ def run(
         print(f"오디오 보정 실패, 원본 오디오로 계속 진행: {exc}")
         stt_input_path = path
 
-    # VAD로 발화 구간 감지 (항상 실행 — 청크 분할에 사용)
-    speech_timestamps = None
-    try:
-        wav = read_audio(str(stt_input_path), sampling_rate=16000)
-        model = load_silero_vad()
-        speech_timestamps = get_speech_timestamps(
-            wav, model,
-            sampling_rate=16000,
-            speech_pad_ms=VAD_SPEECH_PAD_MS,
-            min_silence_duration_ms=VAD_MIN_SILENCE_DURATION_MS,
-        )
-        if speech_timestamps:
-            print(f"VAD: {len(speech_timestamps)}개 발화 구간 감지")
-        else:
-            print("VAD: 발화 구간 없음")
-    except Exception as exc:
-        print(f"VAD 실패, 고정 분할로 진행: {exc}")
-
     chunking_applied = should_use_chunking(str(stt_input_path))
 
     if num_speakers is None:
@@ -194,7 +142,6 @@ def run(
         num_speakers=num_speakers,
         initial_prompt=context,
         skip_diarization=num_speakers is None,
-        speech_timestamps=speech_timestamps,
     )
     transcript = normalize_terms(format_transcript(merged), term_metadata)
     speaker_count = num_speakers or len(set(item["speaker"] for item in merged))
@@ -207,7 +154,7 @@ def run(
         "transcript": transcript,
         "doc_content": doc_content,  # Claude 교정용, 없으면 ""
         "agenda_items": agenda_items,  # 안건 항목 목록, 없으면 []
-        "vad_applied": speech_timestamps is not None and len(speech_timestamps) > 0,
+        "vad_applied": False,
         "chunking_applied": chunking_applied,
         "source_audio_path": str(original_path),
         "stt_audio_path": str(stt_input_path),

@@ -46,16 +46,100 @@ def get_pyannote_pipeline(hf_token: str):
     return _PYANNOTE_PIPELINE
 
 
-def _is_apple_silicon() -> bool:
-    """Apple Silicon(M시리즈) 여부 감지."""
-    return platform.machine() == "arm64" or platform.processor() == "arm"
+def _get_ram_gb() -> float:
+    """시스템 전체 RAM(GB) 반환. 실패 시 0."""
+    try:
+        import subprocess
+        if platform.system() == "Darwin":
+            out = subprocess.run(["sysctl", "hw.memsize"], capture_output=True, text=True)
+            return int(out.stdout.split(":")[1].strip()) / 1024 ** 3
+        # Linux
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemTotal:"):
+                    return int(line.split()[1]) / 1024 ** 2
+    except Exception:
+        pass
+    return 0.0
+
+
+def detect_hw_config() -> dict:
+    """CPU/GPU/OS를 감지해 최적 Whisper 백엔드·모델·compute_type을 반환한다.
+
+    반환 예시:
+        {
+            "backend": "mlx" | "cuda" | "cpu",
+            "model": "large-v3" | "medium",
+            "device": "cpu" | "cuda",       # mlx는 해당 없음
+            "compute_type": "int8" | "float16",
+            "label": "Apple Silicon M (16GB) → mlx large-v3",
+        }
+    """
+    # ── Apple Silicon (mlx-whisper, Metal GPU) ──────────────────────────────
+    if platform.system() == "Darwin" and platform.machine() == "arm64":
+        ram = _get_ram_gb()
+        model = "large-v3" if ram >= 8 else "medium"
+        mlx_repo = (
+            "mlx-community/whisper-large-v3-mlx" if model == "large-v3"
+            else "mlx-community/whisper-medium-mlx"
+        )
+        return {
+            "backend": "mlx",
+            "model": model,
+            "mlx_repo": mlx_repo,
+            "device": None,
+            "compute_type": None,
+            "label": f"Apple Silicon (Metal, {ram:.0f}GB RAM) → mlx {model}",
+        }
+
+    # ── NVIDIA CUDA ─────────────────────────────────────────────────────────
+    if torch.cuda.is_available():
+        vram = torch.cuda.get_device_properties(0).total_memory / 1024 ** 3
+        gpu_name = torch.cuda.get_device_properties(0).name
+        if vram >= 8:
+            model, compute_type = "large-v3", "float16"
+        elif vram >= 4:
+            model, compute_type = "large-v3", "int8"
+        else:
+            model, compute_type = "medium", "int8"
+        return {
+            "backend": "cuda",
+            "model": model,
+            "device": "cuda",
+            "compute_type": compute_type,
+            "label": f"NVIDIA {gpu_name} ({vram:.0f}GB VRAM) → cuda {model} {compute_type}",
+        }
+
+    # ── CPU fallback ─────────────────────────────────────────────────────────
+    ram = _get_ram_gb()
+    model = "large-v3" if ram >= 8 else "medium"
+    return {
+        "backend": "cpu",
+        "model": model,
+        "device": "cpu",
+        "compute_type": "int8",
+        "label": f"CPU ({ram:.0f}GB RAM) → cpu {model} int8",
+    }
+
+
+_HW_CONFIG: dict = {}
+
+
+def get_hw_config() -> dict:
+    """하드웨어 설정을 1회만 감지하고 캐싱한다."""
+    global _HW_CONFIG
+    if not _HW_CONFIG:
+        _HW_CONFIG = detect_hw_config()
+        print(f"[HW] {_HW_CONFIG['label']}")
+    return _HW_CONFIG
 
 
 def get_whisper_model() -> WhisperModel:
-    """Whisper 모델을 1회만 로드하고 재사용한다."""
+    """faster-whisper 모델을 1회만 로드하고 재사용한다 (CUDA/CPU 전용)."""
     global _WHISPER_MODEL
     if _WHISPER_MODEL is None:
-        _WHISPER_MODEL = WhisperModel("large-v3", device="cpu", compute_type="int8")
+        cfg = get_hw_config()
+        _WHISPER_MODEL = WhisperModel(cfg["model"], device=cfg["device"], compute_type=cfg["compute_type"])
     return _WHISPER_MODEL
 
 
@@ -112,10 +196,11 @@ def _run_whisper_faster(audio_path: str, initial_prompt: Optional[str] = None) -
 def _run_whisper_mlx(audio_path: str, initial_prompt: Optional[str] = None) -> list[dict]:
     """mlx-whisper로 STT 실행 (Apple Silicon — Metal GPU 가속)."""
     import mlx_whisper
-    print("Whisper STT 실행 중 (mlx-whisper, Metal 가속)...")
+    cfg = get_hw_config()
+    print(f"Whisper STT 실행 중 (mlx-whisper, Metal 가속, {cfg['model']})...")
     result = mlx_whisper.transcribe(
         audio_path,
-        path_or_hf_repo="mlx-community/whisper-large-v3-mlx",
+        path_or_hf_repo=cfg["mlx_repo"],
         language="ko",
         initial_prompt=initial_prompt,
         condition_on_previous_text=WHISPER_CONDITION_ON_PREVIOUS_TEXT,
@@ -132,8 +217,9 @@ def _run_whisper_mlx(audio_path: str, initial_prompt: Optional[str] = None) -> l
 
 
 def run_whisper(audio_path: str, initial_prompt: Optional[str] = None) -> list[dict]:
-    """STT 실행. Apple Silicon이면 mlx-whisper, 아니면 faster-whisper 사용."""
-    if _is_apple_silicon():
+    """하드웨어 감지 후 최적 백엔드로 STT 실행."""
+    cfg = get_hw_config()
+    if cfg["backend"] == "mlx":
         return _run_whisper_mlx(audio_path, initial_prompt)
     return _run_whisper_faster(audio_path, initial_prompt)
 
@@ -190,62 +276,6 @@ def _build_chunk_ranges(duration_sec: float, max_chunk_sec: float, overlap_sec: 
 MIN_CHUNK_SEC = 15.0
 
 
-def _build_vad_chunk_ranges(
-    speech_timestamps: list[dict],
-    duration_sec: float,
-    max_chunk_sec: float,
-) -> list[tuple[float, float]]:
-    """VAD 타임스탬프 기반으로 무음 구간에서 청크를 나눈다."""
-    if duration_sec <= max_chunk_sec:
-        return [(0.0, duration_sec)]
-
-    # 무음 구간 중간점 추출 (최소 0.3초 이상 무음)
-    silence_midpoints = []
-    for i in range(len(speech_timestamps) - 1):
-        gap_start = speech_timestamps[i]["end"] / 16000
-        gap_end = speech_timestamps[i + 1]["start"] / 16000
-        if gap_end - gap_start >= 0.3:
-            silence_midpoints.append((gap_start + gap_end) / 2)
-
-    if not silence_midpoints:
-        return _build_chunk_ranges(duration_sec, max_chunk_sec, DEFAULT_OVERLAP_SEC)
-
-    # 탐욕적 분할: max_chunk_sec 이내에서 가장 늦은 무음 지점에서 자르기
-    ranges = []
-    chunk_start = 0.0
-
-    while chunk_start < duration_sec - 1.0:
-        chunk_end_target = chunk_start + max_chunk_sec
-        if chunk_end_target >= duration_sec:
-            ranges.append((chunk_start, duration_sec))
-            break
-
-        best_split = None
-        for mp in silence_midpoints:
-            if chunk_start < mp <= chunk_end_target:
-                best_split = mp
-
-        if best_split:
-            ranges.append((chunk_start, best_split))
-            chunk_start = best_split
-        else:
-            # 무음 지점 없으면 고정 분할 (fallback)
-            ranges.append((chunk_start, chunk_end_target))
-            chunk_start = chunk_end_target
-
-    # 짧은 청크를 인접 청크와 합치기
-    merged = [ranges[0]]
-    for r in ranges[1:]:
-        prev_len = merged[-1][1] - merged[-1][0]
-        curr_len = r[1] - r[0]
-        if prev_len < MIN_CHUNK_SEC or curr_len < MIN_CHUNK_SEC:
-            merged[-1] = (merged[-1][0], r[1])
-        else:
-            merged.append(r)
-
-    return merged
-
-
 def _extract_audio_chunk(audio_path: str, start_sec: float, end_sec: float, chunk_index: int) -> str:
     """ffmpeg로 청크를 임시 wav로 추출한다."""
     duration = max(end_sec - start_sec, 0.1)
@@ -287,20 +317,14 @@ def run_whisper_chunked(
     initial_prompt: Optional[str] = None,
     max_chunk_sec: float = DEFAULT_MAX_CHUNK_SEC,
     overlap_sec: float = DEFAULT_OVERLAP_SEC,
-    speech_timestamps: Optional[list[dict]] = None,
 ) -> list[dict]:
     """긴 오디오는 청크로 나눠 Whisper를 실행하고 병합한다."""
     duration_sec = _get_audio_duration(audio_path)
     if duration_sec is None or duration_sec <= max_chunk_sec:
         return run_whisper(audio_path, initial_prompt=initial_prompt)
 
-    # VAD 기반 청크 분할 (speech_timestamps가 있으면 사용)
-    if speech_timestamps:
-        chunk_ranges = _build_vad_chunk_ranges(speech_timestamps, duration_sec, max_chunk_sec)
-        print(f"VAD 기반 청크 분할: {len(chunk_ranges)}개")
-    else:
-        chunk_ranges = _build_chunk_ranges(duration_sec, max_chunk_sec, overlap_sec)
-        print(f"고정 시간 청크 분할: {len(chunk_ranges)}개")
+    chunk_ranges = _build_chunk_ranges(duration_sec, max_chunk_sec, overlap_sec)
+    print(f"고정 시간 청크 분할: {len(chunk_ranges)}개")
 
     all_segments = []
     prev_chunk_text = ""
@@ -457,11 +481,10 @@ def transcribe(
     num_speakers: Optional[int] = None,
     initial_prompt: Optional[str] = None,
     skip_diarization: bool = False,
-    speech_timestamps: Optional[list[dict]] = None,
 ) -> list[dict]:
     """전체 파이프라인: STT + (선택적) 화자분리 병렬 실행 + 병합."""
     if skip_diarization:
-        segments = run_whisper_chunked(audio_path, initial_prompt=initial_prompt, speech_timestamps=speech_timestamps)
+        segments = run_whisper_chunked(audio_path, initial_prompt=initial_prompt)
         return [{"speaker": "Speaker A", "start": s["start"],
                  "end": s["end"], "text": s["text"]} for s in segments]
 
@@ -469,7 +492,7 @@ def transcribe(
     with ThreadPoolExecutor(max_workers=2) as executor:
         stt_future = executor.submit(
             run_whisper_chunked, audio_path, initial_prompt,
-            DEFAULT_MAX_CHUNK_SEC, DEFAULT_OVERLAP_SEC, speech_timestamps,
+            DEFAULT_MAX_CHUNK_SEC, DEFAULT_OVERLAP_SEC,
         )
         diar_future = executor.submit(run_diarization, audio_path, num_speakers)
 
